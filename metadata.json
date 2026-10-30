@@ -1,0 +1,6 @@
+{
+  "name": "Play Nexa",
+  "description": "Professional short-form video editor with multi-track timeline, real-time Media3 ExoPlayer preview, and Media3 Transformer MP4 export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

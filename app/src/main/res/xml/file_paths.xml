@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <cache-path name="exports_cache" path="exports/" />
+    <files-path name="thumbnails_files" path="thumbnails/" />
+    <external-path name="external_movies" path="Movies/" />
+</paths>
