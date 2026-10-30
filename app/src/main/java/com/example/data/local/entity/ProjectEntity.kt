@@ -32,5 +32,6 @@ data class ProjectEntity(
   val createdAt: Long = System.currentTimeMillis(),
   val updatedAt: Long = System.currentTimeMillis(),
   val aspectRatio: String = AspectRatio.RATIO_9_16.rawValue,
-  val durationMs: Long = 0L
+  val durationMs: Long = 0L,
+  val isOriginalAudioMuted: Boolean = false
 )

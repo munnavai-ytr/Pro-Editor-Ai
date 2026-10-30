@@ -23,4 +23,7 @@ interface MediaAssetDao {
 
   @Insert(onConflict = OnConflictStrategy.REPLACE)
   suspend fun insertAssets(assets: List<MediaAssetEntity>): List<Long>
+
+  @Query("DELETE FROM media_assets WHERE projectId = :projectId")
+  suspend fun deleteAssetsForProject(projectId: Long)
 }

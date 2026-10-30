@@ -14,6 +14,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -29,9 +30,11 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.VolumeUp
 import androidx.compose.material.icons.filled.AudioFile
 import androidx.compose.material.icons.filled.AutoFixHigh
 import androidx.compose.material.icons.filled.TextFields
@@ -40,14 +43,18 @@ import androidx.compose.material.icons.outlined.AudioFile
 import androidx.compose.material.icons.outlined.AutoFixHigh
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.ContentCut
+import androidx.compose.material.icons.outlined.Crop
 import androidx.compose.material.icons.outlined.DeleteOutline
+import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.Layers
 import androidx.compose.material.icons.outlined.PlayCircle
 import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.Speed
 import androidx.compose.material.icons.outlined.TextFields
+import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material.icons.outlined.VideoLibrary
 import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.Animation
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material3.CircularProgressIndicator
@@ -78,6 +85,11 @@ import coil.compose.AsyncImage
 import com.example.R
 import com.example.data.local.entity.AspectRatio
 import com.example.data.local.entity.MediaAssetEntity
+import com.example.data.local.entity.MediaType
+import com.example.data.local.entity.TextAlignOption
+import com.example.data.local.entity.TrackType
+import com.example.data.local.entity.TransitionType
+import com.example.domain.model.ClipEditToolSubmode
 import com.example.domain.model.EditorBottomTab
 import com.example.domain.model.ExportResolution
 import com.example.domain.model.ExportState
@@ -93,28 +105,65 @@ import com.example.ui.theme.NexaRedDim
 import com.example.ui.theme.NexaSuccess
 import com.example.ui.theme.NexaSurface
 import com.example.ui.theme.NexaSurfaceElevated
-import com.example.ui.theme.NexaTextDisabled
 import com.example.ui.theme.NexaTextPrimary
 import com.example.ui.theme.NexaTextSecondary
 import java.io.File
 import kotlin.math.abs
+import kotlin.math.roundToInt
 
 private val SPEED_OPTIONS = listOf(0.5f, 1.0f, 1.5f, 2.0f, 3.0f)
 
 @Composable
 fun EditorContextualPanel(
   activeTab: EditorBottomTab,
+  activeSubmode: ClipEditToolSubmode,
+  isInteractiveCropMode: Boolean,
   selectedClip: TimelineClipUiModel?,
-  showSpeedPicker: Boolean,
+  playheadMs: Long,
+  isOriginalAudioMuted: Boolean,
   assets: List<MediaAssetEntity>,
+  audioTrackClips: List<TimelineClipUiModel>,
+  textTrackClips: List<TimelineClipUiModel>,
   isImportingMedia: Boolean,
+  onSelectClip: (Long) -> Unit,
+  onToggleSubmode: (ClipEditToolSubmode) -> Unit,
   onSplitClip: () -> Unit,
-  onToggleSpeedPicker: () -> Unit,
   onSelectSpeed: (Float) -> Unit,
+  onLiveVolumeChange: (Float) -> Unit,
+  onCommitVolume: () -> Unit,
+  onSelectPresetVolume: (Float) -> Unit,
+  onToggleKeyframes: () -> Unit,
+  onAddOrRemoveKeyframeAtPlayhead: () -> Unit,
+  onLiveLayerOpacityChange: (Float) -> Unit,
+  onCommitLayerOpacity: () -> Unit,
+  onResetLayerTransform: () -> Unit,
+  onRotate90: () -> Unit,
+  onFlipHorizontal: () -> Unit,
+  onFlipVertical: () -> Unit,
+  onToggleInteractiveCrop: () -> Unit,
+  onResetCropAndTransform: () -> Unit,
+  onLiveColorChange: (Float, Float, Float) -> Unit,
+  onCommitColorChange: () -> Unit,
+  onResetColorAdjustments: () -> Unit,
+  onSelectTransition: (TransitionType, Long) -> Unit,
+  onOpenAddTextDialog: () -> Unit,
+  onOpenEditTextDialog: () -> Unit,
+  onUpdateSelectedTextStyle: (
+    fontFamily: String?,
+    fontSize: Float?,
+    color: Int?,
+    backgroundColor: Int?,
+    updateBackground: Boolean,
+    alignment: TextAlignOption?,
+    isBold: Boolean?,
+    isItalic: Boolean?
+  ) -> Unit,
   onDuplicateClip: () -> Unit,
   onDeleteClip: () -> Unit,
   onPickMainMedia: () -> Unit,
   onPickOverlayMedia: () -> Unit,
+  onPickAudioFile: () -> Unit,
+  onToggleOriginalAudioMute: () -> Unit,
   onReuseAsset: (assetId: Long, asOverlay: Boolean) -> Unit,
   modifier: Modifier = Modifier
 ) {
@@ -127,20 +176,119 @@ fun EditorContextualPanel(
     Column(modifier = Modifier.fillMaxWidth()) {
       HorizontalDivider(color = NexaBorderSubtle)
 
-      // Inline Spring-Animated Speed Picker when toggled on a selected clip
+      // Keyframes & Opacity Strip for Overlay & Text clips when Keyframe mode is enabled
+      val showKeyframeBar = activeTab == EditorBottomTab.EDIT &&
+        selectedClip != null &&
+        (selectedClip.trackType == TrackType.OVERLAY || selectedClip.trackType == TrackType.TEXT) &&
+        (selectedClip.hasKeyframesEnabled || selectedClip.keyframes.isNotEmpty())
+
       AnimatedVisibility(
-        visible = selectedClip != null && showSpeedPicker && activeTab == EditorBottomTab.EDIT,
+        visible = showKeyframeBar,
         enter = expandVertically(spring(stiffness = Spring.StiffnessMedium)) + fadeIn(),
         exit = shrinkVertically(spring(stiffness = Spring.StiffnessMedium)) + fadeOut()
       ) {
         if (selectedClip != null) {
-          SpeedPickerStrip(
-            currentSpeed = selectedClip.speed,
-            onSelectSpeed = { speed ->
+          KeyframesAndOpacityStrip(
+            selectedClip = selectedClip,
+            playheadMs = playheadMs,
+            onAddOrRemoveKeyframeAtPlayhead = {
               haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-              onSelectSpeed(speed)
-            }
+              onAddOrRemoveKeyframeAtPlayhead()
+            },
+            onLiveOpacityChange = onLiveLayerOpacityChange,
+            onCommitOpacityChange = onCommitLayerOpacity,
+            onResetLayerTransform = onResetLayerTransform
           )
+        }
+      }
+
+      // Active Clip Inspector Sub-Panel (Speed, Volume, Crop/Flip, Color Adjust, Transition, Text Style)
+      AnimatedVisibility(
+        visible = selectedClip != null && activeTab == EditorBottomTab.EDIT && activeSubmode != ClipEditToolSubmode.NONE,
+        enter = expandVertically(spring(stiffness = Spring.StiffnessMedium)) + fadeIn(),
+        exit = shrinkVertically(spring(stiffness = Spring.StiffnessMedium)) + fadeOut()
+      ) {
+        if (selectedClip != null) {
+          when (activeSubmode) {
+            ClipEditToolSubmode.SPEED -> {
+              SpeedPickerStrip(
+                currentSpeed = selectedClip.speed,
+                onSelectSpeed = { speed ->
+                  haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                  onSelectSpeed(speed)
+                }
+              )
+            }
+
+            ClipEditToolSubmode.VOLUME -> {
+              VolumeInspectorStrip(
+                currentVolume = selectedClip.volume,
+                onLiveVolumeChange = onLiveVolumeChange,
+                onCommitVolume = onCommitVolume,
+                onSelectPresetVolume = { preset ->
+                  haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                  onSelectPresetVolume(preset)
+                }
+              )
+            }
+
+            ClipEditToolSubmode.CROP_TRANSFORM -> {
+              CropRotateFlipStrip(
+                selectedClip = selectedClip,
+                isInteractiveCropMode = isInteractiveCropMode,
+                onRotate90 = {
+                  haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                  onRotate90()
+                },
+                onFlipHorizontal = {
+                  haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                  onFlipHorizontal()
+                },
+                onFlipVertical = {
+                  haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                  onFlipVertical()
+                },
+                onToggleInteractiveCrop = {
+                  haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                  onToggleInteractiveCrop()
+                },
+                onResetAll = onResetCropAndTransform
+              )
+            }
+
+            ClipEditToolSubmode.COLOR_ADJUST -> {
+              ColorAdjustmentStrip(
+                brightness = selectedClip.brightness,
+                contrast = selectedClip.contrast,
+                saturation = selectedClip.saturation,
+                onLiveChange = onLiveColorChange,
+                onCommitChange = onCommitColorChange,
+                onReset = onResetColorAdjustments
+              )
+            }
+
+            ClipEditToolSubmode.TRANSITION -> {
+              TransitionInspectorStrip(
+                selectedClip = selectedClip,
+                onSelectTransition = { type, dur ->
+                  haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                  onSelectTransition(type, dur)
+                }
+              )
+            }
+
+            ClipEditToolSubmode.TEXT_STYLE -> {
+              selectedClip.textOverlay?.let { tx ->
+                InlineTextStyleStrip(
+                  textOverlay = tx,
+                  onEditContentClick = onOpenEditTextDialog,
+                  onUpdateStyle = onUpdateSelectedTextStyle
+                )
+              }
+            }
+
+            ClipEditToolSubmode.NONE -> Unit
+          }
         }
       }
 
@@ -157,15 +305,20 @@ fun EditorContextualPanel(
             if (selectedClip != null) {
               ClipContextualToolbar(
                 selectedClip = selectedClip,
-                isSpeedOpen = showSpeedPicker,
+                activeSubmode = activeSubmode,
                 onSplit = {
                   haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                   onSplitClip()
                 },
-                onSpeed = {
+                onToggleSubmode = { sub ->
                   haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                  onToggleSpeedPicker()
+                  onToggleSubmode(sub)
                 },
+                onToggleKeyframes = {
+                  haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                  onToggleKeyframes()
+                },
+                onEditTextContent = onOpenEditTextDialog,
                 onDuplicate = {
                   haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                   onDuplicateClip()
@@ -182,7 +335,7 @@ fun EditorContextualPanel(
 
           EditorBottomTab.MEDIA -> {
             MediaDrawerPanel(
-              assets = assets,
+              assets = assets.filter { it.type != MediaType.AUDIO },
               isImporting = isImportingMedia,
               onPickMainMedia = onPickMainMedia,
               onPickOverlayMedia = onPickOverlayMedia,
@@ -191,16 +344,21 @@ fun EditorContextualPanel(
           }
 
           EditorBottomTab.AUDIO -> {
-            UpcomingFeatureStubBar(
-              title = stringResource(R.string.audio_stub_title),
-              description = stringResource(R.string.audio_stub_desc)
+            AudioTabDrawerPanel(
+              audioClips = audioTrackClips,
+              isOriginalAudioMuted = isOriginalAudioMuted,
+              isImporting = isImportingMedia,
+              onPickAudioFile = onPickAudioFile,
+              onToggleOriginalAudioMute = onToggleOriginalAudioMute,
+              onSelectAudioClip = onSelectClip
             )
           }
 
           EditorBottomTab.TEXT -> {
-            UpcomingFeatureStubBar(
-              title = stringResource(R.string.text_stub_title),
-              description = stringResource(R.string.text_stub_desc)
+            TextTabDrawerPanel(
+              textClips = textTrackClips,
+              onAddTextLayer = onOpenAddTextDialog,
+              onSelectTextClip = onSelectClip
             )
           }
         }
@@ -212,20 +370,24 @@ fun EditorContextualPanel(
 @Composable
 private fun ClipContextualToolbar(
   selectedClip: TimelineClipUiModel,
-  isSpeedOpen: Boolean,
+  activeSubmode: ClipEditToolSubmode,
   onSplit: () -> Unit,
-  onSpeed: () -> Unit,
+  onToggleSubmode: (ClipEditToolSubmode) -> Unit,
+  onToggleKeyframes: () -> Unit,
+  onEditTextContent: () -> Unit,
   onDuplicate: () -> Unit,
   onDelete: () -> Unit
 ) {
   Row(
     modifier = Modifier
       .fillMaxWidth()
-      .height(64.dp)
-      .padding(horizontal = 12.dp),
-    horizontalArrangement = Arrangement.SpaceEvenly,
+      .height(62.dp)
+      .horizontalScroll(rememberScrollState())
+      .padding(horizontal = 10.dp),
+    horizontalArrangement = Arrangement.spacedBy(6.dp),
     verticalAlignment = Alignment.CenterVertically
   ) {
+    // 1. Split (all track types)
     ClipActionItem(
       icon = Icons.Outlined.ContentCut,
       label = stringResource(R.string.clip_split),
@@ -234,18 +396,135 @@ private fun ClipContextualToolbar(
       testTag = "action_split",
       onClick = onSplit
     )
-    ClipActionItem(
-      icon = Icons.Outlined.Speed,
-      label = if (abs(selectedClip.speed - 1.0f) > 0.01f) {
-        "${selectedClip.speed}x"
-      } else {
-        stringResource(R.string.clip_speed)
-      },
-      isActive = isSpeedOpen || abs(selectedClip.speed - 1.0f) > 0.01f,
-      tint = if (isSpeedOpen) NexaCyan else NexaTextPrimary,
-      testTag = "action_speed",
-      onClick = onSpeed
-    )
+
+    // 2. Keyframe Toggle (◆) for Overlay and Text tracks
+    if (selectedClip.trackType == TrackType.OVERLAY || selectedClip.trackType == TrackType.TEXT) {
+      val kfActive = selectedClip.hasKeyframesEnabled || selectedClip.keyframes.isNotEmpty()
+      Surface(
+        onClick = onToggleKeyframes,
+        color = if (kfActive) Color(0x28FFD166) else Color.Transparent,
+        shape = RoundedCornerShape(10.dp),
+        border = if (kfActive) BorderStroke(1.dp, Color(0xFFFFD166)) else null,
+        modifier = Modifier
+          .height(50.dp)
+          .width(74.dp)
+          .testTag("action_keyframe")
+      ) {
+        Column(
+          horizontalAlignment = Alignment.CenterHorizontally,
+          verticalArrangement = Arrangement.Center
+        ) {
+          DiamondIconGlyph(
+            tint = if (kfActive) Color(0xFFFFD166) else NexaTextPrimary,
+            modifier = Modifier.size(16.dp)
+          )
+          Spacer(modifier = Modifier.height(4.dp))
+          Text(
+            text = stringResource(R.string.clip_keyframe),
+            style = MaterialTheme.typography.labelSmall,
+            color = if (kfActive) Color(0xFFFFD166) else NexaTextPrimary,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1
+          )
+        }
+      }
+    }
+
+    // 3. Text Content & Style Controls (Text clips)
+    if (selectedClip.trackType == TrackType.TEXT) {
+      ClipActionItem(
+        icon = Icons.Outlined.Edit,
+        label = stringResource(R.string.clip_edit_text),
+        isActive = false,
+        tint = NexaTextPrimary,
+        testTag = "action_edit_text",
+        onClick = onEditTextContent
+      )
+      ClipActionItem(
+        icon = Icons.Outlined.TextFields,
+        label = stringResource(R.string.clip_text_style),
+        isActive = activeSubmode == ClipEditToolSubmode.TEXT_STYLE,
+        tint = if (activeSubmode == ClipEditToolSubmode.TEXT_STYLE) NexaCyan else NexaTextPrimary,
+        testTag = "action_text_style",
+        onClick = { onToggleSubmode(ClipEditToolSubmode.TEXT_STYLE) }
+      )
+    }
+
+    // 4. Speed Control (Video, Video Overlay, Audio)
+    if (selectedClip.trackType != TrackType.TEXT && selectedClip.mediaType != MediaType.IMAGE) {
+      val isSpeedOpen = activeSubmode == ClipEditToolSubmode.SPEED
+      ClipActionItem(
+        icon = Icons.Outlined.Speed,
+        label = if (abs(selectedClip.speed - 1.0f) > 0.01f) "${selectedClip.speed}x" else stringResource(R.string.clip_speed),
+        isActive = isSpeedOpen || abs(selectedClip.speed - 1.0f) > 0.01f,
+        tint = if (isSpeedOpen) NexaCyan else NexaTextPrimary,
+        testTag = "action_speed",
+        onClick = { onToggleSubmode(ClipEditToolSubmode.SPEED) }
+      )
+    }
+
+    // 5. Volume Control (Audio & Main Video clips)
+    if (selectedClip.trackType == TrackType.AUDIO ||
+      (selectedClip.trackType == TrackType.VIDEO && selectedClip.mediaType == MediaType.VIDEO)
+    ) {
+      val isVolOpen = activeSubmode == ClipEditToolSubmode.VOLUME
+      val pct = (selectedClip.volume * 100f).roundToInt()
+      ClipActionItem(
+        icon = Icons.AutoMirrored.Outlined.VolumeUp,
+        label = if (pct != 100) "$pct%" else stringResource(R.string.clip_volume),
+        isActive = isVolOpen || pct != 100,
+        tint = if (isVolOpen) NexaCyan else NexaTextPrimary,
+        testTag = "action_volume",
+        onClick = { onToggleSubmode(ClipEditToolSubmode.VOLUME) }
+      )
+    }
+
+    // 6. Crop / Rotate 90° / Flip & Color Adjustments (Video & Overlay clips)
+    if (selectedClip.trackType == TrackType.VIDEO || selectedClip.trackType == TrackType.OVERLAY) {
+      val isCropOpen = activeSubmode == ClipEditToolSubmode.CROP_TRANSFORM
+      val hasTransform = selectedClip.hasCustomCrop ||
+        selectedClip.rotationDegrees % 360 != 0 ||
+        selectedClip.flipHorizontal ||
+        selectedClip.flipVertical
+
+      ClipActionItem(
+        icon = Icons.Outlined.Crop,
+        label = stringResource(R.string.clip_transform),
+        isActive = isCropOpen || hasTransform,
+        tint = if (isCropOpen) NexaCyan else NexaTextPrimary,
+        testTag = "action_crop_transform",
+        onClick = { onToggleSubmode(ClipEditToolSubmode.CROP_TRANSFORM) }
+      )
+
+      val isAdjustOpen = activeSubmode == ClipEditToolSubmode.COLOR_ADJUST
+      ClipActionItem(
+        icon = Icons.Outlined.Tune,
+        label = stringResource(R.string.clip_adjust),
+        isActive = isAdjustOpen || selectedClip.hasColorAdjustments,
+        tint = if (isAdjustOpen) NexaCyan else NexaTextPrimary,
+        testTag = "action_color_adjust",
+        onClick = { onToggleSubmode(ClipEditToolSubmode.COLOR_ADJUST) }
+      )
+    }
+
+    // 7. Transition Picker (Main Video clips after the first clip)
+    if (selectedClip.trackType == TrackType.VIDEO && selectedClip.trackIndex == 0 && selectedClip.orderIndex > 0) {
+      val isTransOpen = activeSubmode == ClipEditToolSubmode.TRANSITION
+      ClipActionItem(
+        icon = Icons.Rounded.Animation,
+        label = if (selectedClip.transitionType != TransitionType.NONE) {
+          selectedClip.transitionType.label
+        } else {
+          stringResource(R.string.clip_transition)
+        },
+        isActive = isTransOpen || selectedClip.transitionType != TransitionType.NONE,
+        tint = if (isTransOpen) NexaCyan else NexaTextPrimary,
+        testTag = "action_transition",
+        onClick = { onToggleSubmode(ClipEditToolSubmode.TRANSITION) }
+      )
+    }
+
+    // 8. Duplicate & Delete
     ClipActionItem(
       icon = Icons.Outlined.ContentCopy,
       label = stringResource(R.string.clip_duplicate),
@@ -254,6 +533,7 @@ private fun ClipContextualToolbar(
       testTag = "action_duplicate",
       onClick = onDuplicate
     )
+
     ClipActionItem(
       icon = Icons.Outlined.DeleteOutline,
       label = stringResource(R.string.clip_delete),
@@ -282,19 +562,20 @@ private fun ClipActionItem(
     shape = RoundedCornerShape(10.dp),
     border = if (isActive) BorderStroke(1.dp, NexaCyan) else null,
     modifier = Modifier
-      .height(52.dp)
-      .width(78.dp)
+      .height(50.dp)
+      .width(74.dp)
       .testTag(testTag)
   ) {
     Column(
       horizontalAlignment = Alignment.CenterHorizontally,
-      verticalArrangement = Arrangement.Center
+      verticalArrangement = Arrangement.Center,
+      modifier = Modifier.padding(horizontal = 4.dp)
     ) {
       Icon(
         imageVector = icon,
         contentDescription = label,
         tint = tint,
-        modifier = Modifier.size(20.dp)
+        modifier = Modifier.size(19.dp)
       )
       Spacer(modifier = Modifier.height(3.dp))
       Text(
@@ -302,7 +583,8 @@ private fun ClipActionItem(
         style = MaterialTheme.typography.labelSmall,
         color = tint,
         fontWeight = FontWeight.SemiBold,
-        maxLines = 1
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis
       )
     }
   }
@@ -350,7 +632,7 @@ private fun SpeedPickerStrip(
         Box(
           modifier = Modifier
             .weight(1f)
-            .height(40.dp)
+            .height(38.dp)
             .clip(RoundedCornerShape(8.dp))
             .background(
               if (isSelected) NexaAccentGradient
@@ -362,7 +644,7 @@ private fun SpeedPickerStrip(
               RoundedCornerShape(8.dp)
             )
             .clickable { onSelectSpeed(speedOpt) }
-            .testTag("speed_option_${label}"),
+            .testTag("speed_option_$label"),
           contentAlignment = Alignment.Center
         ) {
           Text(
@@ -382,7 +664,7 @@ private fun EmptyEditHintBar() {
   Box(
     modifier = Modifier
       .fillMaxWidth()
-      .height(64.dp)
+      .height(58.dp)
       .padding(horizontal = 20.dp),
     contentAlignment = Alignment.Center
   ) {
@@ -413,7 +695,6 @@ private fun MediaDrawerPanel(
       modifier = Modifier.fillMaxWidth(),
       horizontalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-      // + Add to Main Track
       Box(
         modifier = Modifier
           .weight(1f)
@@ -441,7 +722,6 @@ private fun MediaDrawerPanel(
         }
       }
 
-      // + Add Overlay (PiP)
       Surface(
         onClick = onPickOverlayMedia,
         enabled = !isImporting,
@@ -502,7 +782,7 @@ private fun ProjectAssetChip(
     color = NexaSurfaceElevated,
     shape = RoundedCornerShape(8.dp),
     border = BorderStroke(1.dp, NexaBorderSubtle),
-    modifier = Modifier.height(44.dp)
+    modifier = Modifier.height(42.dp)
   ) {
     Row(
       verticalAlignment = Alignment.CenterVertically,
@@ -510,7 +790,7 @@ private fun ProjectAssetChip(
     ) {
       Box(
         modifier = Modifier
-          .size(44.dp)
+          .size(42.dp)
           .background(NexaBlack)
       ) {
         if (!asset.thumbnailPath.isNullOrBlank() && File(asset.thumbnailPath).exists()) {
@@ -553,55 +833,6 @@ private fun ProjectAssetChip(
   }
 }
 
-@Composable
-private fun UpcomingFeatureStubBar(
-  title: String,
-  description: String
-) {
-  Row(
-    modifier = Modifier
-      .fillMaxWidth()
-      .height(64.dp)
-      .padding(horizontal = 16.dp),
-    verticalAlignment = Alignment.CenterVertically,
-    horizontalArrangement = Arrangement.SpaceBetween
-  ) {
-    Column(modifier = Modifier.weight(1f)) {
-      Row(verticalAlignment = Alignment.CenterVertically) {
-        Text(
-          text = title,
-          style = MaterialTheme.typography.titleSmall,
-          color = NexaTextPrimary
-        )
-        Spacer(modifier = Modifier.width(8.dp))
-        Surface(
-          color = Color(0x287C3AED),
-          shape = RoundedCornerShape(4.dp)
-        ) {
-          Text(
-            text = "ROADMAP",
-            style = MaterialTheme.typography.labelSmall,
-            color = NexaCyan,
-            modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp)
-          )
-        }
-      }
-      Spacer(modifier = Modifier.height(2.dp))
-      Text(
-        text = description,
-        style = MaterialTheme.typography.labelSmall,
-        color = NexaTextSecondary,
-        maxLines = 2,
-        overflow = TextOverflow.Ellipsis
-      )
-    }
-  }
-}
-
-/**
- * CapCut-style Bottom Toolbar: outlined icons when inactive, filled when active,
- * with vivid cyan-to-purple accent underline indicator and navigation bar safe area padding.
- */
 @Composable
 fun EditorBottomNavigationBar(
   activeTab: EditorBottomTab,
@@ -651,7 +882,7 @@ fun EditorBottomNavigationBar(
         modifier = Modifier
           .fillMaxWidth()
           .navigationBarsPadding()
-          .height(58.dp)
+          .height(56.dp)
           .padding(horizontal = 8.dp),
         horizontalArrangement = Arrangement.SpaceEvenly,
         verticalAlignment = Alignment.CenterVertically
@@ -667,7 +898,7 @@ fun EditorBottomNavigationBar(
           Column(
             modifier = Modifier
               .weight(1f)
-              .height(54.dp)
+              .height(52.dp)
               .clip(RoundedCornerShape(8.dp))
               .clickable {
                 haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
@@ -681,16 +912,16 @@ fun EditorBottomNavigationBar(
               imageVector = if (isSelected) spec.filledIcon else spec.outlinedIcon,
               contentDescription = stringResource(spec.labelRes),
               tint = if (isSelected) NexaCyan else NexaTextSecondary,
-              modifier = Modifier.size(22.dp)
+              modifier = Modifier.size(21.dp)
             )
-            Spacer(modifier = Modifier.height(3.dp))
+            Spacer(modifier = Modifier.height(2.dp))
             Text(
               text = stringResource(spec.labelRes),
               style = MaterialTheme.typography.labelSmall,
               color = if (isSelected) NexaTextPrimary else NexaTextSecondary,
               fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium
             )
-            Spacer(modifier = Modifier.height(3.dp))
+            Spacer(modifier = Modifier.height(2.dp))
             Box(
               modifier = Modifier
                 .width(24.dp * indicatorFraction)
@@ -741,7 +972,7 @@ fun ExportSheetContent(
         )
         Spacer(modifier = Modifier.height(4.dp))
         Text(
-          text = "$projectName • ${aspectRatio.rawValue} • $clipCount ${if (clipCount == 1) "clip" else "clips"} • ${
+          text = "$projectName • ${aspectRatio.rawValue} • $clipCount ${if (clipCount == 1) "layer" else "layers"} • ${
             TimeFormatUtils.formatDurationBadge(totalDurationMs)
           }",
           style = MaterialTheme.typography.bodySmall,
@@ -782,21 +1013,15 @@ fun ExportSheetContent(
                 .testTag("export_res_${res.shortSidePx}")
             ) {
               Column(modifier = Modifier.padding(14.dp)) {
-                Row(
-                  modifier = Modifier.fillMaxWidth(),
-                  horizontalArrangement = Arrangement.SpaceBetween,
-                  verticalAlignment = Alignment.CenterVertically
-                ) {
-                  Text(
-                    text = res.label,
-                    style = MaterialTheme.typography.titleMedium,
-                    color = if (isSelected) NexaCyan else NexaTextPrimary,
-                    fontWeight = FontWeight.Bold
-                  )
-                }
+                Text(
+                  text = res.label,
+                  style = MaterialTheme.typography.titleMedium,
+                  color = if (isSelected) NexaCyan else NexaTextPrimary,
+                  fontWeight = FontWeight.Bold
+                )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                  text = "${w} × ${h} MP4",
+                  text = "$w × $h MP4",
                   style = MaterialTheme.typography.labelMedium,
                   color = NexaTextPrimary
                 )

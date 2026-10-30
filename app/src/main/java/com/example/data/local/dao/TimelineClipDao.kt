@@ -37,4 +37,7 @@ interface TimelineClipDao {
 
   @Query("DELETE FROM timeline_clips WHERE id = :clipId")
   suspend fun deleteClipById(clipId: Long)
+
+  @Query("DELETE FROM timeline_clips WHERE projectId = :projectId")
+  suspend fun deleteClipsForProject(projectId: Long)
 }

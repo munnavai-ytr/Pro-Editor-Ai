@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.room.Room
 import com.example.data.local.PlayNexaDatabase
 import com.example.data.local.dao.MediaAssetDao
+import com.example.data.local.dao.OverlayAndKeyframeDao
 import com.example.data.local.dao.ProjectDao
 import com.example.data.local.dao.TimelineClipDao
 import dagger.Module
@@ -42,4 +43,8 @@ object DatabaseModule {
   @Provides
   fun provideTimelineClipDao(database: PlayNexaDatabase): TimelineClipDao =
     database.timelineClipDao()
+
+  @Provides
+  fun provideOverlayAndKeyframeDao(database: PlayNexaDatabase): OverlayAndKeyframeDao =
+    database.overlayAndKeyframeDao()
 }

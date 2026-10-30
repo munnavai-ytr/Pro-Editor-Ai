@@ -24,6 +24,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.automirrored.rounded.Redo
+import androidx.compose.material.icons.automirrored.rounded.Undo
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.rounded.FileUpload
 import androidx.compose.material3.AlertDialog
@@ -70,6 +72,7 @@ import com.example.ui.editor.components.EditorBottomNavigationBar
 import com.example.ui.editor.components.EditorContextualPanel
 import com.example.ui.editor.components.ExportSheetContent
 import com.example.ui.editor.components.MultiTrackTimeline
+import com.example.ui.editor.components.TextOverlayEditorDialog
 import com.example.ui.editor.components.VideoPreviewStage
 import com.example.ui.theme.NexaAccentGradient
 import com.example.ui.theme.NexaBlack
@@ -77,6 +80,7 @@ import com.example.ui.theme.NexaBorderSubtle
 import com.example.ui.theme.NexaCyan
 import com.example.ui.theme.NexaSurface
 import com.example.ui.theme.NexaSurfaceElevated
+import com.example.ui.theme.NexaTextDisabled
 import com.example.ui.theme.NexaTextPrimary
 import com.example.ui.theme.NexaTextSecondary
 
@@ -115,6 +119,15 @@ fun EditorScreen(
     }
   }
 
+  val addAudioFileLauncher = rememberLauncherForActivityResult(
+    contract = ActivityResultContracts.OpenDocument()
+  ) { uri ->
+    if (uri != null) {
+      haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+      viewModel.addPickedAudio(uri)
+    }
+  }
+
   LaunchedEffect(uiState.snackbarMessage) {
     uiState.snackbarMessage?.let { msg ->
       snackbarHostState.showSnackbar(msg)
@@ -130,11 +143,21 @@ fun EditorScreen(
       EditorTopBar(
         projectName = uiState.project?.name ?: "Loading…",
         aspectRatioLabel = uiState.aspectRatio.rawValue,
+        canUndo = uiState.canUndo,
+        canRedo = uiState.canRedo,
         onBack = {
           viewModel.pausePlayback()
           onNavigateBack()
         },
         onEditProjectName = viewModel::openRenameDialog,
+        onUndo = {
+          haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+          viewModel.undo()
+        },
+        onRedo = {
+          haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+          viewModel.redo()
+        },
         onToggleAspectRatio = {
           haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
           viewModel.cycleAspectRatio()
@@ -149,13 +172,42 @@ fun EditorScreen(
       Column(modifier = Modifier.fillMaxWidth()) {
         EditorContextualPanel(
           activeTab = uiState.activeTab,
+          activeSubmode = uiState.activeSubmode,
+          isInteractiveCropMode = uiState.isInteractiveCropMode,
           selectedClip = uiState.selectedClip,
-          showSpeedPicker = uiState.showSpeedPicker,
+          playheadMs = uiState.playheadMs,
+          isOriginalAudioMuted = uiState.isOriginalAudioMuted,
           assets = uiState.assets,
+          audioTrackClips = uiState.audioTrackClips,
+          textTrackClips = uiState.textTrackClips,
           isImportingMedia = uiState.isImportingMedia,
+          onSelectClip = { id -> viewModel.selectClip(id) },
+          onToggleSubmode = viewModel::toggleSubmode,
           onSplitClip = viewModel::splitSelectedClipAtPlayhead,
-          onToggleSpeedPicker = viewModel::toggleSpeedPicker,
           onSelectSpeed = viewModel::setSelectedClipSpeed,
+          onLiveVolumeChange = viewModel::onLiveVolumeChange,
+          onCommitVolume = viewModel::commitLiveVolume,
+          onSelectPresetVolume = { preset ->
+            viewModel.onLiveVolumeChange(preset)
+            viewModel.commitLiveVolume()
+          },
+          onToggleKeyframes = viewModel::toggleSelectedClipKeyframes,
+          onAddOrRemoveKeyframeAtPlayhead = viewModel::addOrRemoveKeyframeAtPlayhead,
+          onLiveLayerOpacityChange = viewModel::onLiveLayerOpacityChange,
+          onCommitLayerOpacity = viewModel::commitLiveCanvasTransform,
+          onResetLayerTransform = viewModel::resetSelectedLayerTransform,
+          onRotate90 = viewModel::rotateSelectedClip90,
+          onFlipHorizontal = viewModel::flipSelectedClipHorizontal,
+          onFlipVertical = viewModel::flipSelectedClipVertical,
+          onToggleInteractiveCrop = viewModel::toggleInteractiveCropMode,
+          onResetCropAndTransform = viewModel::resetSelectedClipCropAndTransform,
+          onLiveColorChange = viewModel::onLiveColorAdjustChange,
+          onCommitColorChange = viewModel::commitLiveColorAdjust,
+          onResetColorAdjustments = viewModel::resetSelectedClipColorAdjustments,
+          onSelectTransition = viewModel::setSelectedClipTransition,
+          onOpenAddTextDialog = viewModel::openAddTextDialog,
+          onOpenEditTextDialog = viewModel::openEditSelectedTextDialog,
+          onUpdateSelectedTextStyle = viewModel::updateSelectedTextStyle,
           onDuplicateClip = viewModel::duplicateSelectedClip,
           onDeleteClip = viewModel::deleteSelectedClip,
           onPickMainMedia = {
@@ -169,6 +221,10 @@ fun EditorScreen(
               PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
             )
           },
+          onPickAudioFile = {
+            addAudioFileLauncher.launch(arrayOf("audio/*"))
+          },
+          onToggleOriginalAudioMute = viewModel::toggleOriginalVideoAudioMute,
           onReuseAsset = viewModel::addExistingAsset
         )
 
@@ -184,22 +240,35 @@ fun EditorScreen(
         .fillMaxSize()
         .padding(innerPadding)
     ) {
-      // Top Half: Real-time Media3 ExoPlayer Preview Stage + Transport Bar
+      // Top Half: Real-time Media3 ExoPlayer Preview Stage + Interactive Layers + Transport Bar
       VideoPreviewStage(
         aspectRatio = uiState.aspectRatio,
+        isOriginalAudioMuted = uiState.isOriginalAudioMuted,
         mainTrackClips = uiState.mainTrackClips,
         overlayTracks = uiState.overlayTracks,
-        selectedClipId = uiState.selectedClipId,
+        textTrackClips = uiState.textTrackClips,
+        audioTrackClips = uiState.audioTrackClips,
+        selectedClip = uiState.selectedClip,
+        isInteractiveCropMode = uiState.isInteractiveCropMode,
         playheadMs = uiState.playheadMs,
         totalDurationMs = uiState.totalDurationMs,
         isPlaying = uiState.isPlaying,
         seekCommand = uiState.seekCommand,
         zoomScale = uiState.zoomScale,
+        textBitmapRenderer = viewModel.textBitmapRenderer,
         onTogglePlayPause = viewModel::togglePlayPause,
         onRestartToBeginning = { viewModel.scrubTo(0L, pauseIfPlaying = true) },
         onPlaybackPositionUpdated = viewModel::onExoPlayerPositionUpdated,
         onPlaybackEnded = viewModel::onExoPlayerPlaybackEnded,
-        onSelectOverlayClip = viewModel::selectClip,
+        onSelectClip = { id -> viewModel.selectClip(id) },
+        onDoubleTapTextClip = viewModel::openEditSelectedTextDialog,
+        onLiveCanvasTransform = { clipId, ox, oy, sc, rot ->
+          viewModel.onLiveCanvasTransform(clipId, ox, oy, sc, rot)
+        },
+        onCommitCanvasTransform = viewModel::commitLiveCanvasTransform,
+        onLiveCropChange = viewModel::onLiveCropChange,
+        onCommitCrop = viewModel::commitInteractiveCrop,
+        onResetCrop = viewModel::resetSelectedClipCropAndTransform,
         onZoomIn = {
           haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
           viewModel.updateZoom(1.25f)
@@ -214,15 +283,18 @@ fun EditorScreen(
         },
         modifier = Modifier
           .fillMaxWidth()
-          .weight(0.52f)
+          .weight(0.50f)
       )
 
       HorizontalDivider(color = NexaBorderSubtle)
 
-      // Bottom Half: Multi-Track Zoomable Filmstrip Timeline
+      // Bottom Half: Multi-Track Zoomable Timeline (Text, Overlay, Video w/ Transitions, Audio)
       MultiTrackTimeline(
         mainTrackClips = uiState.mainTrackClips,
         overlayTracks = uiState.overlayTracks,
+        textTrackClips = uiState.textTrackClips,
+        audioTrackClips = uiState.audioTrackClips,
+        isOriginalAudioMuted = uiState.isOriginalAudioMuted,
         totalDurationMs = uiState.totalDurationMs,
         playheadMs = uiState.playheadMs,
         isPlaying = uiState.isPlaying,
@@ -231,12 +303,15 @@ fun EditorScreen(
         filmstripGenerator = viewModel.filmstripGenerator,
         onScrubTo = { targetMs -> viewModel.scrubTo(targetMs, pauseIfPlaying = true) },
         onPinchZoomDelta = viewModel::updateZoom,
-        onSelectClip = viewModel::selectClip,
+        onSelectClip = { id -> viewModel.selectClip(id) },
+        onClickTransitionJunction = viewModel::openTransitionJunction,
+        onToggleOriginalAudioMute = viewModel::toggleOriginalVideoAudioMute,
         onLiveTrimUpdate = viewModel::onLiveTrimUpdate,
         onCommitLiveTrim = viewModel::commitLiveTrim,
         onReorderMainClip = viewModel::reorderMainTrackClip,
-        onLiveOverlayMove = viewModel::onLiveOverlayMove,
-        onCommitOverlayMove = viewModel::commitLiveOverlayMove,
+        onLiveNonMainMove = viewModel::onLiveNonMainMove,
+        onCommitNonMainMove = viewModel::commitLiveNonMainMove,
+        onRequestAddText = viewModel::openAddTextDialog,
         onRequestAddOverlay = { trackIdx ->
           pendingOverlayTrackIdx = trackIdx
           addOverlayMediaLauncher.launch(
@@ -248,11 +323,26 @@ fun EditorScreen(
             PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
           )
         },
+        onRequestAddAudio = {
+          addAudioFileLauncher.launch(arrayOf("audio/*"))
+        },
         modifier = Modifier
           .fillMaxWidth()
-          .weight(0.48f)
+          .weight(0.50f)
       )
     }
+  }
+
+  // Text Overlay Add / Edit Dialog
+  if (uiState.showTextEditorDialog) {
+    val existingTextEntity = uiState.editingTextClipId?.let { editId ->
+      uiState.textTrackClips.firstOrNull { it.id == editId }?.textOverlay
+    }
+    TextOverlayEditorDialog(
+      initialOverlay = existingTextEntity,
+      onDismiss = viewModel::dismissTextDialog,
+      onConfirm = viewModel::confirmTextDialog
+    )
   }
 
   // Editable Project Name Dialog
@@ -366,8 +456,12 @@ fun EditorScreen(
 private fun EditorTopBar(
   projectName: String,
   aspectRatioLabel: String,
+  canUndo: Boolean,
+  canRedo: Boolean,
   onBack: () -> Unit,
   onEditProjectName: () -> Unit,
+  onUndo: () -> Unit,
+  onRedo: () -> Unit,
   onToggleAspectRatio: () -> Unit,
   onExport: () -> Unit
 ) {
@@ -380,8 +474,8 @@ private fun EditorTopBar(
         modifier = Modifier
           .fillMaxWidth()
           .statusBarsPadding()
-          .height(56.dp)
-          .padding(horizontal = 8.dp),
+          .height(54.dp)
+          .padding(horizontal = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween
       ) {
@@ -408,7 +502,7 @@ private fun EditorTopBar(
               .weight(1f, fill = false)
               .clip(RoundedCornerShape(8.dp))
               .clickable(onClick = onEditProjectName)
-              .padding(horizontal = 8.dp, vertical = 8.dp)
+              .padding(horizontal = 6.dp, vertical = 6.dp)
               .testTag("editor_project_name"),
             verticalAlignment = Alignment.CenterVertically
           ) {
@@ -419,34 +513,66 @@ private fun EditorTopBar(
               maxLines = 1,
               overflow = TextOverflow.Ellipsis
             )
-            Spacer(modifier = Modifier.width(6.dp))
+            Spacer(modifier = Modifier.width(4.dp))
             Icon(
               imageVector = Icons.Outlined.Edit,
               contentDescription = stringResource(R.string.action_rename),
               tint = NexaTextSecondary,
-              modifier = Modifier.size(15.dp)
+              modifier = Modifier.size(14.dp)
             )
           }
         }
 
-        // Right: Aspect Ratio Toggle Pill + Gradient Export Button
+        // Right: Undo + Redo + Aspect Ratio Chip + Gradient Export Button
         Row(
           verticalAlignment = Alignment.CenterVertically,
-          horizontalArrangement = Arrangement.spacedBy(8.dp),
+          horizontalArrangement = Arrangement.spacedBy(2.dp),
           modifier = Modifier.padding(end = 6.dp)
         ) {
+          IconButton(
+            onClick = onUndo,
+            enabled = canUndo,
+            modifier = Modifier
+              .size(40.dp)
+              .testTag("undo_button")
+          ) {
+            Icon(
+              imageVector = Icons.AutoMirrored.Rounded.Undo,
+              contentDescription = stringResource(R.string.action_undo),
+              tint = if (canUndo) NexaTextPrimary else NexaTextDisabled,
+              modifier = Modifier.size(20.dp)
+            )
+          }
+
+          IconButton(
+            onClick = onRedo,
+            enabled = canRedo,
+            modifier = Modifier
+              .size(40.dp)
+              .testTag("redo_button")
+          ) {
+            Icon(
+              imageVector = Icons.AutoMirrored.Rounded.Redo,
+              contentDescription = stringResource(R.string.action_redo),
+              tint = if (canRedo) NexaTextPrimary else NexaTextDisabled,
+              modifier = Modifier.size(20.dp)
+            )
+          }
+
+          Spacer(modifier = Modifier.width(2.dp))
+
           Surface(
             onClick = onToggleAspectRatio,
             color = NexaSurfaceElevated,
             shape = RoundedCornerShape(8.dp),
             border = BorderStroke(1.dp, NexaBorderSubtle),
             modifier = Modifier
-              .height(36.dp)
+              .height(34.dp)
               .testTag("editor_aspect_ratio_chip")
           ) {
             Box(
               contentAlignment = Alignment.Center,
-              modifier = Modifier.padding(horizontal = 10.dp)
+              modifier = Modifier.padding(horizontal = 8.dp)
             ) {
               Text(
                 text = aspectRatioLabel,
@@ -457,13 +583,15 @@ private fun EditorTopBar(
             }
           }
 
+          Spacer(modifier = Modifier.width(4.dp))
+
           Box(
             modifier = Modifier
-              .height(38.dp)
+              .height(36.dp)
               .clip(RoundedCornerShape(8.dp))
               .background(NexaAccentGradient)
               .clickable(onClick = onExport)
-              .padding(horizontal = 14.dp)
+              .padding(horizontal = 12.dp)
               .testTag("export_button"),
             contentAlignment = Alignment.Center
           ) {
@@ -472,7 +600,7 @@ private fun EditorTopBar(
                 imageVector = Icons.Rounded.FileUpload,
                 contentDescription = null,
                 tint = NexaBlack,
-                modifier = Modifier.size(16.dp)
+                modifier = Modifier.size(15.dp)
               )
               Spacer(modifier = Modifier.width(4.dp))
               Text(

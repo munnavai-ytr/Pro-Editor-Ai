@@ -1,6 +1,7 @@
 package com.example.ui.editor.components
 
 import android.graphics.Color as AndroidColor
+import android.media.audiofx.LoudnessEnhancer
 import android.net.Uri
 import android.view.ViewGroup
 import androidx.annotation.OptIn
@@ -39,14 +40,17 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -55,6 +59,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
@@ -62,10 +67,13 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
-import coil.compose.AsyncImage
 import com.example.R
 import com.example.data.local.entity.AspectRatio
 import com.example.data.local.entity.MediaType
+import com.example.data.local.entity.TrackType
+import com.example.data.media.Media3EffectsFactory
+import com.example.data.media.TextBitmapRenderer
+import com.example.domain.model.KeyframeInterpolator
 import com.example.domain.model.TimeFormatUtils
 import com.example.domain.model.TimelineClipUiModel
 import com.example.ui.editor.SeekCommand
@@ -78,31 +86,44 @@ import com.example.ui.theme.NexaTextDisabled
 import com.example.ui.theme.NexaTextPrimary
 import com.example.ui.theme.NexaTextSecondary
 import kotlin.math.abs
+import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
 
 @OptIn(UnstableApi::class)
 @Composable
 fun VideoPreviewStage(
   aspectRatio: AspectRatio,
+  isOriginalAudioMuted: Boolean,
   mainTrackClips: List<TimelineClipUiModel>,
   overlayTracks: Map<Int, List<TimelineClipUiModel>>,
-  selectedClipId: Long?,
+  textTrackClips: List<TimelineClipUiModel>,
+  audioTrackClips: List<TimelineClipUiModel>,
+  selectedClip: TimelineClipUiModel?,
+  isInteractiveCropMode: Boolean,
   playheadMs: Long,
   totalDurationMs: Long,
   isPlaying: Boolean,
   seekCommand: SeekCommand,
   zoomScale: Float,
+  textBitmapRenderer: TextBitmapRenderer,
   onTogglePlayPause: () -> Unit,
   onRestartToBeginning: () -> Unit,
   onPlaybackPositionUpdated: (Long) -> Unit,
   onPlaybackEnded: () -> Unit,
-  onSelectOverlayClip: (Long) -> Unit,
+  onSelectClip: (Long) -> Unit,
+  onDoubleTapTextClip: () -> Unit,
+  onLiveCanvasTransform: (clipId: Long, offsetX: Float, offsetY: Float, scale: Float, rotationDeg: Float) -> Unit,
+  onCommitCanvasTransform: () -> Unit,
+  onLiveCropChange: (left: Float, top: Float, right: Float, bottom: Float) -> Unit,
+  onCommitCrop: (closeOverlay: Boolean) -> Unit,
+  onResetCrop: () -> Unit,
   onZoomIn: () -> Unit,
   onZoomOut: () -> Unit,
   onResetZoom: () -> Unit,
   modifier: Modifier = Modifier
 ) {
   val context = LocalContext.current
+  val density = LocalDensity.current
   val lifecycleOwner = LocalLifecycleOwner.current
 
   val latestMainClips by rememberUpdatedState(mainTrackClips)
@@ -117,11 +138,24 @@ fun VideoPreviewStage(
     }
   }
 
+  var mainLoudnessEnhancer by remember(exoPlayer) {
+    mutableStateOf<LoudnessEnhancer?>(null)
+  }
+
   DisposableEffect(exoPlayer, lifecycleOwner) {
     val listener = object : Player.Listener {
       override fun onPlaybackStateChanged(playbackState: Int) {
         if (playbackState == Player.STATE_ENDED) {
           latestOnPlaybackEnded()
+        }
+      }
+
+      override fun onAudioSessionIdChanged(audioSessionId: Int) {
+        if (audioSessionId != C.AUDIO_SESSION_ID_UNSET && audioSessionId > 0) {
+          runCatching {
+            mainLoudnessEnhancer?.release()
+            mainLoudnessEnhancer = LoudnessEnhancer(audioSessionId)
+          }
         }
       }
 
@@ -148,11 +182,65 @@ fun VideoPreviewStage(
     onDispose {
       lifecycleOwner.lifecycle.removeObserver(lifecycleObserver)
       exoPlayer.removeListener(listener)
+      runCatching { mainLoudnessEnhancer?.release() }
       exoPlayer.release()
     }
   }
 
-  // Structural signature of main track clips to rebuild/update MediaItems immediately on trims/splits/reorders
+  // Synchronized Audio Track playback
+  AudioTrackPreviewController(
+    audioClips = audioTrackClips,
+    playheadMs = playheadMs,
+    isPlaying = isPlaying,
+    seekCommand = seekCommand
+  )
+
+  // Determine active Main Video Track clip at current playheadMs
+  val activeMainIndexAndOffset = remember(mainTrackClips, playheadMs) {
+    mapTimelineToExoPosition(mainTrackClips, playheadMs)
+  }
+  val activeMainClip = mainTrackClips.getOrNull(activeMainIndexAndOffset.first)
+
+  // Apply Original Audio Mute + Per-Clip Volume (0-200%) on main ExoPlayer
+  val targetMainVolume = if (isOriginalAudioMuted) 0f else (activeMainClip?.volume ?: 1f)
+  LaunchedEffect(exoPlayer, mainLoudnessEnhancer, targetMainVolume) {
+    applyVolumeWithBoost(exoPlayer, mainLoudnessEnhancer, targetMainVolume)
+  }
+
+  // Apply Media3 per-clip Video Effects (Crop, Rotate 90°, Flip H/V, Brightness/Contrast/Saturation)
+  val isEditingActiveMainCrop = isInteractiveCropMode && selectedClip?.id == activeMainClip?.id
+  val mainEffectClip = remember(activeMainClip, isEditingActiveMainCrop) {
+    if (activeMainClip == null) {
+      null
+    } else if (isEditingActiveMainCrop) {
+      // Show full uncropped frame underneath interactive crop handles while dragging crop bounds
+      activeMainClip.copy(cropLeft = 0f, cropTop = 0f, cropRight = 1f, cropBottom = 1f)
+    } else {
+      activeMainClip
+    }
+  }
+  val mainEffectsSignature = remember(mainEffectClip) {
+    if (mainEffectClip == null) {
+      "empty"
+    } else {
+      "${mainEffectClip.id}|${mainEffectClip.cropLeft},${mainEffectClip.cropTop},${mainEffectClip.cropRight},${mainEffectClip.cropBottom}|" +
+        "${mainEffectClip.rotationDegrees}|${mainEffectClip.flipHorizontal}|${mainEffectClip.flipVertical}|" +
+        "${mainEffectClip.brightness}|${mainEffectClip.contrast}|${mainEffectClip.saturation}"
+    }
+  }
+  LaunchedEffect(exoPlayer, mainEffectsSignature) {
+    runCatching {
+      val effects = mainEffectClip?.let { Media3EffectsFactory.buildPerClipVideoEffects(it) }.orEmpty()
+      exoPlayer.setVideoEffects(effects)
+    }
+  }
+
+  // Evaluate Basic Transition at current playheadMs (Fade, Slide Left, Slide Right, Zoom In)
+  val activeTransitionFrame = remember(mainTrackClips, playheadMs) {
+    Media3EffectsFactory.evaluateTransitionAtMs(mainTrackClips, playheadMs)
+  }
+
+  // Rebuild MediaItems playlist when main track structure/trims change
   val playlistSignature = remember(mainTrackClips) {
     mainTrackClips.joinToString("|") { clip ->
       "${clip.id}:${clip.sourceUri}:${clip.trimStartMs}:${clip.trimEndMs}:${clip.mediaType}:${
@@ -217,13 +305,18 @@ fun VideoPreviewStage(
     }
   }
 
-  // Active overlay clips at current playheadMs (sorted bottom-to-top by trackIndex)
+  // Active Overlay clips at current playheadMs (sorted bottom-to-top by trackIndex)
   val activeOverlays = remember(overlayTracks, playheadMs) {
     overlayTracks.entries
       .sortedBy { it.key }
-      .mapNotNull { (_, trackClips) ->
-        trackClips.firstOrNull { playheadMs >= it.startMs && playheadMs < it.endMs }
+      .flatMap { (_, trackClips) ->
+        trackClips.filter { playheadMs >= it.startMs && playheadMs < it.endMs }
       }
+  }
+
+  // Active Text Overlay clips at current playheadMs
+  val activeTextClips = remember(textTrackClips, playheadMs) {
+    textTrackClips.filter { playheadMs >= it.startMs && playheadMs < it.endMs && it.textOverlay != null }
   }
 
   Column(modifier = modifier.fillMaxWidth()) {
@@ -238,18 +331,15 @@ fun VideoPreviewStage(
       val containerRatio = if (maxHeight > 0.dp) maxWidth / maxHeight else 1f
       val targetRatio = aspectRatio.ratioFloat
 
-      val stageModifier = if (containerRatio > targetRatio) {
-        Modifier
-          .fillMaxHeight()
-          .width(maxHeight * targetRatio)
-      } else {
-        Modifier
-          .fillMaxWidth()
-          .height(maxWidth / targetRatio)
-      }
+      val stageWidthDp = if (containerRatio > targetRatio) maxHeight * targetRatio else maxWidth
+      val stageHeightDp = if (containerRatio > targetRatio) maxHeight else maxWidth / targetRatio
+      val stageWidthPx = with(density) { stageWidthDp.toPx().coerceAtLeast(1f) }
+      val stageHeightPx = with(density) { stageHeightDp.toPx().coerceAtLeast(1f) }
 
       Box(
-        modifier = stageModifier
+        modifier = Modifier
+          .width(stageWidthDp)
+          .height(stageHeightDp)
           .clip(RoundedCornerShape(12.dp))
           .background(Color(0xFF050507))
           .border(1.dp, NexaBorderSubtle, RoundedCornerShape(12.dp))
@@ -275,47 +365,140 @@ fun VideoPreviewStage(
             )
           }
         } else {
-          AndroidView(
-            factory = { ctx ->
-              PlayerView(ctx).apply {
-                useController = false
-                resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-                setShutterBackgroundColor(AndroidColor.parseColor("#050507"))
-                setBackgroundColor(AndroidColor.parseColor("#050507"))
-                layoutParams = ViewGroup.LayoutParams(
-                  ViewGroup.LayoutParams.MATCH_PARENT,
-                  ViewGroup.LayoutParams.MATCH_PARENT
-                )
-                player = exoPlayer
+          // 1. Base Main Video Layer (with live Transition animation)
+          Box(
+            modifier = Modifier
+              .fillMaxSize()
+              .graphicsLayer {
+                translationX = activeTransitionFrame.translationFractionX * stageWidthPx
+                scaleX = activeTransitionFrame.scale
+                scaleY = activeTransitionFrame.scale
+                alpha = activeTransitionFrame.alpha
               }
-            },
-            update = { view ->
-              if (view.player !== exoPlayer) {
-                view.player = exoPlayer
-              }
-            },
-            modifier = Modifier.fillMaxSize()
-          )
-
-          // Render synchronized PiP Overlays matching Media3 Transformer VideoCompositorSettings
-          activeOverlays.forEachIndexed { index, overlayClip ->
-            OverlayPipPreviewBox(
-              overlayClip = overlayClip,
-              playheadMs = playheadMs,
-              isPlaying = isPlaying,
-              isSelected = overlayClip.id == selectedClipId,
-              stackOffsetIndex = index,
-              onClick = { onSelectOverlayClip(overlayClip.id) },
-              modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(
-                  end = 10.dp,
-                  bottom = (10 + index * 18).dp
-                )
-                .fillMaxWidth(0.38f)
-                .fillMaxHeight(0.38f)
+          ) {
+            AndroidView(
+              factory = { ctx ->
+                PlayerView(ctx).apply {
+                  useController = false
+                  resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+                  setShutterBackgroundColor(AndroidColor.parseColor("#050507"))
+                  setBackgroundColor(AndroidColor.parseColor("#050507"))
+                  layoutParams = ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                  )
+                  player = exoPlayer
+                }
+              },
+              update = { view ->
+                if (view.player !== exoPlayer) {
+                  view.player = exoPlayer
+                }
+              },
+              modifier = Modifier.fillMaxSize()
             )
           }
+        }
+
+        // 2. Interactive Keyframe-Interpolated Overlay (PiP) Layers
+        activeOverlays.forEach { overlayClip ->
+          val localTimeMs = (playheadMs - overlayClip.startMs).coerceIn(0L, overlayClip.timelineDurationMs)
+          val eval = KeyframeInterpolator.evaluateOverlay(
+            transform = overlayClip.overlayTransform,
+            keyframes = overlayClip.keyframes,
+            localTimeMs = localTimeMs
+          )
+
+          InteractiveCanvasLayerBox(
+            clipId = overlayClip.id,
+            evaluatedTransform = eval,
+            baseWidthDp = stageWidthDp,
+            baseHeightDp = stageHeightDp,
+            stageWidthPx = stageWidthPx,
+            stageHeightPx = stageHeightPx,
+            isSelected = selectedClip?.id == overlayClip.id && !isInteractiveCropMode,
+            hasKeyframes = overlayClip.hasKeyframesEnabled || overlayClip.keyframes.isNotEmpty(),
+            testTag = "overlay_pip_${overlayClip.id}",
+            onSelect = { onSelectClip(overlayClip.id) },
+            onLiveTransform = { ox, oy, sc, rot ->
+              onLiveCanvasTransform(overlayClip.id, ox, oy, sc, rot)
+            },
+            onCommitTransform = onCommitCanvasTransform
+          ) {
+            OverlayPipVisualContent(
+              overlayClip = overlayClip,
+              playheadMs = playheadMs,
+              isPlaying = isPlaying
+            )
+          }
+        }
+
+        // 3. Interactive Keyframe-Interpolated Text Overlay Layers
+        activeTextClips.forEach { textClip ->
+          val tx = textClip.textOverlay ?: return@forEach
+          val localTimeMs = (playheadMs - textClip.startMs).coerceIn(0L, textClip.timelineDurationMs)
+          val eval = KeyframeInterpolator.evaluateText(
+            textOverlay = tx,
+            keyframes = textClip.keyframes,
+            localTimeMs = localTimeMs
+          )
+          val renderedBmp = remember(
+            tx.content,
+            tx.fontFamily,
+            tx.fontSize,
+            tx.color,
+            tx.backgroundColor,
+            tx.alignment,
+            tx.isBold,
+            tx.isItalic,
+            stageHeightPx.roundToInt()
+          ) {
+            textBitmapRenderer.renderTextBitmap(tx, stageHeightPx.roundToInt().coerceAtLeast(480))
+          }
+          // Size natural text box proportionally to stage height so preview & BitmapOverlay export match
+          val naturalWidthDp = stageHeightDp * (renderedBmp.width.toFloat() / stageHeightPx.coerceAtLeast(1f))
+          val naturalHeightDp = stageHeightDp * (renderedBmp.height.toFloat() / stageHeightPx.coerceAtLeast(1f))
+
+          InteractiveCanvasLayerBox(
+            clipId = textClip.id,
+            evaluatedTransform = eval,
+            baseWidthDp = naturalWidthDp.coerceAtLeast(48.dp),
+            baseHeightDp = naturalHeightDp.coerceAtLeast(28.dp),
+            stageWidthPx = stageWidthPx,
+            stageHeightPx = stageHeightPx,
+            isSelected = selectedClip?.id == textClip.id,
+            hasKeyframes = textClip.hasKeyframesEnabled || textClip.keyframes.isNotEmpty(),
+            testTag = "text_canvas_layer_${textClip.id}",
+            onSelect = { onSelectClip(textClip.id) },
+            onDoubleTap = onDoubleTapTextClip,
+            onLiveTransform = { ox, oy, sc, rot ->
+              onLiveCanvasTransform(textClip.id, ox, oy, sc, rot)
+            },
+            onCommitTransform = onCommitCanvasTransform
+          ) {
+            TextLayerVisualContent(
+              textClip = textClip,
+              textBitmapRenderer = textBitmapRenderer,
+              stageHeightPx = stageHeightPx.roundToInt()
+            )
+          }
+        }
+
+        // 4. Interactive Draggable Crop Frame Overlay when active
+        if (isInteractiveCropMode && selectedClip != null &&
+          (selectedClip.trackType == TrackType.VIDEO || selectedClip.trackType == TrackType.OVERLAY)
+        ) {
+          InteractiveCropStageOverlay(
+            cropLeft = selectedClip.cropLeft,
+            cropTop = selectedClip.cropTop,
+            cropRight = selectedClip.cropRight,
+            cropBottom = selectedClip.cropBottom,
+            stageWidthPx = stageWidthPx,
+            stageHeightPx = stageHeightPx,
+            onLiveCropChange = onLiveCropChange,
+            onCommitCrop = onCommitCrop,
+            onResetCrop = onResetCrop
+          )
         }
       }
     }
@@ -328,7 +511,7 @@ fun VideoPreviewStage(
       Row(
         modifier = Modifier
           .fillMaxWidth()
-          .height(48.dp)
+          .height(46.dp)
           .padding(horizontal = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween
@@ -401,7 +584,7 @@ fun VideoPreviewStage(
           }
         }
 
-        // Right: Quick Timeline Zoom Controls (complements two-finger pinch-to-zoom)
+        // Right: Quick Timeline Zoom Controls
         Row(verticalAlignment = Alignment.CenterVertically) {
           IconButton(
             onClick = onZoomOut,
@@ -448,81 +631,6 @@ fun VideoPreviewStage(
           }
         }
       }
-    }
-  }
-}
-
-@OptIn(UnstableApi::class)
-@Composable
-private fun OverlayPipPreviewBox(
-  overlayClip: TimelineClipUiModel,
-  playheadMs: Long,
-  isPlaying: Boolean,
-  isSelected: Boolean,
-  stackOffsetIndex: Int,
-  onClick: () -> Unit,
-  modifier: Modifier = Modifier
-) {
-  val context = LocalContext.current
-  val borderColor = if (isSelected) NexaCyan else Color.White.copy(alpha = 0.45f)
-
-  Box(
-    modifier = modifier
-      .clip(RoundedCornerShape(8.dp))
-      .background(NexaBlack)
-      .border(if (isSelected) 2.dp else 1.dp, borderColor, RoundedCornerShape(8.dp))
-      .clickable(onClick = onClick)
-      .testTag("overlay_pip_${overlayClip.id}_$stackOffsetIndex")
-  ) {
-    if (overlayClip.mediaType == MediaType.IMAGE) {
-      AsyncImage(
-        model = Uri.parse(overlayClip.sourceUri),
-        contentDescription = "Overlay image",
-        contentScale = ContentScale.Crop,
-        modifier = Modifier.fillMaxSize()
-      )
-    } else {
-      val pipPlayer = remember(overlayClip.id, overlayClip.sourceUri, overlayClip.trimStartMs, overlayClip.trimEndMs) {
-        ExoPlayer.Builder(context).build().apply {
-          volume = 0f // PiP overlay sequence is video-only in Transformer export
-          repeatMode = Player.REPEAT_MODE_OFF
-          setMediaItem(buildPreviewMediaItem(overlayClip))
-          prepare()
-        }
-      }
-
-      DisposableEffect(pipPlayer) {
-        onDispose { pipPlayer.release() }
-      }
-
-      val targetLocalMs = ((playheadMs - overlayClip.startMs) * overlayClip.speed)
-        .toLong()
-        .coerceIn(0L, overlayClip.trimmedSourceDurationMs)
-
-      LaunchedEffect(pipPlayer, isPlaying, overlayClip.speed) {
-        pipPlayer.playbackParameters = PlaybackParameters(overlayClip.speed)
-        pipPlayer.playWhenReady = isPlaying
-      }
-
-      LaunchedEffect(pipPlayer, playheadMs, isPlaying) {
-        if (!isPlaying || abs(pipPlayer.currentPosition - targetLocalMs) > 180L) {
-          pipPlayer.seekTo(targetLocalMs)
-        }
-      }
-
-      AndroidView(
-        factory = { ctx ->
-          PlayerView(ctx).apply {
-            useController = false
-            resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
-            player = pipPlayer
-          }
-        },
-        update = { view ->
-          if (view.player !== pipPlayer) view.player = pipPlayer
-        },
-        modifier = Modifier.fillMaxSize()
-      )
     }
   }
 }

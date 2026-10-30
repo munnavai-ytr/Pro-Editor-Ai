@@ -34,7 +34,9 @@ import androidx.media3.transformer.ProgressHolder
 import androidx.media3.transformer.Transformer
 import com.example.data.local.entity.AspectRatio
 import com.example.data.local.entity.MediaType
+import com.example.data.local.entity.TrackType
 import com.example.domain.model.ExportResolution
+import com.example.domain.model.KeyframeInterpolator
 import com.example.domain.model.TimelineClipUiModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.io.File
@@ -55,7 +57,8 @@ import kotlinx.coroutines.withContext
 @OptIn(UnstableApi::class)
 @Singleton
 class VideoExportManager @Inject constructor(
-  @ApplicationContext private val context: Context
+  @ApplicationContext private val context: Context,
+  private val textBitmapRenderer: TextBitmapRenderer
 ) {
   private val mainHandler = Handler(Looper.getMainLooper())
   private val exportScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -67,6 +70,7 @@ class VideoExportManager @Inject constructor(
   fun startExport(
     projectName: String,
     aspectRatio: AspectRatio,
+    isOriginalAudioMuted: Boolean,
     resolution: ExportResolution,
     clips: List<TimelineClipUiModel>,
     onProgress: (Int) -> Unit,
@@ -77,7 +81,7 @@ class VideoExportManager @Inject constructor(
       cancelActiveExportInternal()
 
       val mainClips = clips
-        .filter { it.trackIndex == 0 }
+        .filter { it.trackType == TrackType.VIDEO && it.trackIndex == 0 }
         .sortedWith(compareBy({ it.orderIndex }, { it.id }))
 
       if (mainClips.isEmpty()) {
@@ -97,7 +101,10 @@ class VideoExportManager @Inject constructor(
       try {
         val composition = buildTimelineComposition(
           mainClips = mainClips,
-          overlayClips = clips.filter { it.trackIndex > 0 },
+          overlayClips = clips.filter { it.trackType == TrackType.OVERLAY && it.trackIndex > 0 },
+          textClips = clips.filter { it.trackType == TrackType.TEXT && it.textOverlay != null },
+          audioClips = clips.filter { it.trackType == TrackType.AUDIO },
+          isOriginalAudioMuted = isOriginalAudioMuted,
           targetWidth = targetWidth,
           targetHeight = targetHeight,
           gapImageUri = gapImageUri
@@ -193,43 +200,58 @@ class VideoExportManager @Inject constructor(
     progressRunnable = null
   }
 
+  private data class OverlayRenderWindow(
+    val startUs: Long,
+    val endUs: Long,
+    val clip: TimelineClipUiModel
+  )
+
   private fun buildTimelineComposition(
     mainClips: List<TimelineClipUiModel>,
     overlayClips: List<TimelineClipUiModel>,
+    textClips: List<TimelineClipUiModel>,
+    audioClips: List<TimelineClipUiModel>,
+    isOriginalAudioMuted: Boolean,
     targetWidth: Int,
     targetHeight: Int,
     gapImageUri: Uri
   ): Composition {
-    val mainEditedItems = mainClips.map { clip -> buildEditedMediaItem(clip, removeAudio = false) }
-    val hasAnyVideoWithPotentialAudio = mainClips.any { it.mediaType == MediaType.VIDEO }
+    val mainDurationMs = mainClips.sumOf { it.timelineDurationMs }.coerceAtLeast(200L)
 
-    val mainSequence = if (hasAnyVideoWithPotentialAudio) {
+    // 1. Build Main Video Sequence (with per-clip Crop, Rotate/Flip, Color Adjust, Speed, Volume/Mute)
+    val mainEditedItems = mainClips.map { clip ->
+      val muteClip = isOriginalAudioMuted || clip.volume <= 0.002f
+      buildEditedVisualItem(clip = clip, removeAudio = muteClip)
+    }
+
+    val needAudioTrackOnMain = (!isOriginalAudioMuted && mainClips.any { it.mediaType == MediaType.VIDEO && it.volume > 0.002f }) ||
+      audioClips.isNotEmpty()
+
+    val mainSequence = if (needAudioTrackOnMain) {
       EditedMediaItemSequence.withAudioAndVideoFrom(mainEditedItems)
     } else {
       EditedMediaItemSequence.withVideoFrom(mainEditedItems)
     }
 
-    val mainDurationMs = mainClips.sumOf { it.timelineDurationMs }.coerceAtLeast(200L)
-
+    // 2. Build PiP Overlay Video/Image Sequences with Keyframe Interpolation Windows
     val overlayByTrack = overlayClips
       .groupBy { it.trackIndex }
-      .toSortedMap(compareByDescending { it }) // Higher trackIndex rendered topmost
+      .toSortedMap(compareByDescending { it })
 
     val overlaySequences = mutableListOf<EditedMediaItemSequence>()
-    val overlayActiveRangesUs = mutableListOf<List<LongRange>>()
+    val overlayWindowsPerInput = mutableListOf<List<OverlayRenderWindow>>()
 
     for ((_, rawTrackClips) in overlayByTrack) {
       val sorted = rawTrackClips.sortedBy { it.startMs }
       val seqItems = mutableListOf<EditedMediaItem>()
-      val activeRanges = mutableListOf<LongRange>()
+      val windows = mutableListOf<OverlayRenderWindow>()
       var cursorMs = 0L
 
       for (ovClip in sorted) {
         if (ovClip.startMs >= mainDurationMs) continue
         val effectiveStartMs = ovClip.startMs.coerceAtLeast(cursorMs)
         if (effectiveStartMs > cursorMs) {
-          val gapMs = effectiveStartMs - cursorMs
-          seqItems.add(buildGapEditedItem(gapImageUri, gapMs))
+          seqItems.add(buildGapEditedItem(gapImageUri, effectiveStartMs - cursorMs))
           cursorMs = effectiveStartMs
         }
 
@@ -240,12 +262,12 @@ class VideoExportManager @Inject constructor(
         val adjustedTrimEnd = (ovClip.trimStartMs + (actualTimelineDur * ovClip.speed).toLong())
           .coerceAtMost(ovClip.trimEndMs)
 
-        val clampedClip = ovClip.copy(trimEndMs = adjustedTrimEnd)
-        seqItems.add(buildEditedMediaItem(clampedClip, removeAudio = true))
+        val clampedClip = ovClip.copy(startMs = cursorMs, trimEndMs = adjustedTrimEnd)
+        seqItems.add(buildEditedVisualItem(clampedClip, removeAudio = true))
 
         val startUs = cursorMs * 1_000L
         val endUs = (cursorMs + clampedClip.timelineDurationMs) * 1_000L
-        activeRanges.add(startUs..endUs)
+        windows.add(OverlayRenderWindow(startUs, endUs, clampedClip))
         cursorMs += clampedClip.timelineDurationMs
       }
 
@@ -253,68 +275,172 @@ class VideoExportManager @Inject constructor(
         seqItems.add(buildGapEditedItem(gapImageUri, mainDurationMs - cursorMs))
       }
 
-      if (seqItems.isNotEmpty() && activeRanges.isNotEmpty()) {
+      if (seqItems.isNotEmpty() && windows.isNotEmpty()) {
         overlaySequences.add(EditedMediaItemSequence.withVideoFrom(seqItems))
-        overlayActiveRangesUs.add(activeRanges)
+        overlayWindowsPerInput.add(windows)
       }
     }
 
-    val presentation = Presentation.createForWidthAndHeight(
-      targetWidth,
-      targetHeight,
-      Presentation.LAYOUT_SCALE_TO_FIT
+    // 3. Build Added Audio Track Sequence(s) with Gap Padding, Trims, Speed, and 0-200% Volume
+    val audioSequences = buildAudioSequences(audioClips, mainDurationMs)
+
+    // 4. Build Composition-Level Video Effects: Transitions + Text BitmapOverlays + Presentation Resolution
+    val compositionVideoEffects = mutableListOf<Effect>()
+    compositionVideoEffects.addAll(Media3EffectsFactory.buildCompositionTransitionEffects(mainClips))
+    compositionVideoEffects.add(
+      Presentation.createForWidthAndHeight(
+        targetWidth,
+        targetHeight,
+        Presentation.LAYOUT_SCALE_TO_FIT
+      )
     )
+    Media3EffectsFactory.buildTextOverlayEffect(
+      textClips = textClips,
+      textRenderer = textBitmapRenderer,
+      outputHeightPx = targetHeight
+    )?.let { textOverlayEffect ->
+      compositionVideoEffects.add(textOverlayEffect)
+    }
 
-    return if (overlaySequences.isEmpty()) {
-      Composition.Builder(listOf(mainSequence))
-        .setEffects(Effects(emptyList(), listOf(presentation)))
-        .build()
-    } else {
-      // Sequence 0..k-1 are PiP overlays (rendered in front), last sequence is full-screen main track
-      val allSequences = overlaySequences + mainSequence
-      val mainSeqId = overlaySequences.size
+    val allSequences = buildList {
+      addAll(overlaySequences)
+      add(mainSequence)
+      addAll(audioSequences)
+    }
 
+    val builder = Composition.Builder(allSequences)
+      .setEffects(Effects(emptyList(), compositionVideoEffects))
+
+    if (overlaySequences.isNotEmpty()) {
+      val mainVideoInputId = overlaySequences.size
       val compositorSettings = object : VideoCompositorSettings {
         override fun getOutputSize(inputSizes: List<Size>): Size {
           return Size(targetWidth, targetHeight)
         }
 
         override fun getOverlaySettings(inputId: Int, presentationTimeUs: Long): OverlaySettings {
-          if (inputId == mainSeqId || inputId !in overlayActiveRangesUs.indices) {
+          if (inputId == mainVideoInputId || inputId !in overlayWindowsPerInput.indices) {
             return StaticOverlaySettings.Builder().build()
           }
-          val isVisible = overlayActiveRangesUs[inputId].any { range ->
-            presentationTimeUs in range
-          }
-          return if (isVisible) {
-            // Position each overlay layer neatly in the bottom-right PiP region
-            val verticalOffset = -0.46f + (inputId * 0.14f).coerceAtMost(0.42f)
-            StaticOverlaySettings.Builder()
-              .setScale(0.38f, 0.38f)
-              .setOverlayFrameAnchor(0f, 0f)
-              .setBackgroundFrameAnchor(0.48f, verticalOffset)
-              .setAlphaScale(1f)
-              .build()
-          } else {
-            StaticOverlaySettings.Builder()
-              .setAlphaScale(0f)
-              .build()
-          }
+          val activeWindow = overlayWindowsPerInput[inputId].firstOrNull { win ->
+            presentationTimeUs >= win.startUs && presentationTimeUs < win.endUs
+          } ?: return StaticOverlaySettings.Builder().setAlphaScale(0f).build()
+
+          val localTimeMs = ((presentationTimeUs - activeWindow.startUs) / 1_000L)
+            .coerceIn(0L, activeWindow.clip.timelineDurationMs)
+          val eval = KeyframeInterpolator.evaluateOverlay(
+            transform = activeWindow.clip.overlayTransform,
+            keyframes = activeWindow.clip.keyframes,
+            localTimeMs = localTimeMs
+          )
+
+          return StaticOverlaySettings.Builder()
+            .setScale(eval.scale, eval.scale)
+            .setOverlayFrameAnchor(0f, 0f)
+            .setBackgroundFrameAnchor(eval.offsetX, -eval.offsetY)
+            .setRotationDegrees(-eval.rotationDeg)
+            .setAlphaScale(eval.opacity)
+            .build()
         }
       }
+      builder.setVideoCompositorSettings(compositorSettings)
+    }
 
-      Composition.Builder(allSequences)
-        .setVideoCompositorSettings(compositorSettings)
-        .setEffects(Effects(emptyList(), listOf(presentation)))
-        .build()
+    return builder.build()
+  }
+
+  private fun buildAudioSequences(
+    audioClips: List<TimelineClipUiModel>,
+    mainDurationMs: Long
+  ): List<EditedMediaItemSequence> {
+    val activeAudio = audioClips
+      .filter { it.volume > 0.002f && it.startMs < mainDurationMs }
+      .sortedBy { it.startMs }
+    if (activeAudio.isEmpty()) return emptyList()
+
+    // Pack non-overlapping audio clips into minimal sequences so overlapping audio clips can also mix
+    val lanes = mutableListOf<MutableList<TimelineClipUiModel>>()
+    for (clip in activeAudio) {
+      val targetLane = lanes.firstOrNull { lane ->
+        val lastEnd = lane.last().endMs
+        clip.startMs >= lastEnd
+      }
+      if (targetLane != null) {
+        targetLane.add(clip)
+      } else {
+        lanes.add(mutableListOf(clip))
+      }
+    }
+
+    return lanes.mapNotNull { lane ->
+      val seqBuilder = EditedMediaItemSequence.Builder(setOf(C.TRACK_TYPE_AUDIO))
+      var cursorMs = 0L
+      var addedAny = false
+
+      for (aClip in lane) {
+        if (aClip.startMs >= mainDurationMs) continue
+        val startAt = aClip.startMs.coerceAtLeast(cursorMs)
+        if (startAt > cursorMs) {
+          seqBuilder.addGap((startAt - cursorMs) * 1_000L)
+          cursorMs = startAt
+        }
+
+        val maxAllowedDur = (mainDurationMs - cursorMs).coerceAtLeast(0L)
+        if (maxAllowedDur < 80L) break
+
+        val actualTimelineDur = aClip.timelineDurationMs.coerceAtMost(maxAllowedDur)
+        val adjustedTrimEnd = (aClip.trimStartMs + (actualTimelineDur * aClip.speed).toLong())
+          .coerceAtMost(aClip.trimEndMs)
+
+        val clippedAudioItem = MediaItem.Builder()
+          .setUri(Uri.parse(aClip.sourceUri))
+          .setClippingConfiguration(
+            MediaItem.ClippingConfiguration.Builder()
+              .setStartPositionMs(aClip.trimStartMs)
+              .setEndPositionMs(adjustedTrimEnd)
+              .build()
+          )
+          .build()
+
+        val audioProcessors = mutableListOf<AudioProcessor>()
+        if (abs(aClip.volume - 1.0f) > 0.01f) {
+          audioProcessors.add(Media3EffectsFactory.buildVolumeAudioProcessor(aClip.volume))
+        }
+        if (abs(aClip.speed - 1.0f) > 0.01f) {
+          val speedPair = Effects.createExperimentalSpeedChangingEffect(
+            ConstantSpeedProvider(aClip.speed)
+          )
+          audioProcessors.add(speedPair.first)
+        }
+
+        val editedAudio = EditedMediaItem.Builder(clippedAudioItem)
+          .setRemoveVideo(true)
+          .setEffects(Effects(audioProcessors, emptyList()))
+          .build()
+
+        seqBuilder.addItem(editedAudio)
+        addedAny = true
+        cursorMs += actualTimelineDur
+      }
+
+      if (addedAny) {
+        if (cursorMs < mainDurationMs) {
+          seqBuilder.addGap((mainDurationMs - cursorMs) * 1_000L)
+        }
+        seqBuilder.build()
+      } else {
+        null
+      }
     }
   }
 
-  private fun buildEditedMediaItem(
+  private fun buildEditedVisualItem(
     clip: TimelineClipUiModel,
     removeAudio: Boolean
   ): EditedMediaItem {
     val uri = Uri.parse(clip.sourceUri)
+    val perClipVideoEffects = Media3EffectsFactory.buildPerClipVideoEffects(clip).toMutableList()
+
     return when (clip.mediaType) {
       MediaType.IMAGE -> {
         val imageItem = MediaItem.Builder()
@@ -323,6 +449,7 @@ class VideoExportManager @Inject constructor(
           .build()
         EditedMediaItem.Builder(imageItem)
           .setFrameRate(30)
+          .setEffects(Effects(emptyList(), perClipVideoEffects))
           .build()
       }
       else -> {
@@ -337,7 +464,9 @@ class VideoExportManager @Inject constructor(
           .build()
 
         val audioProcessors = mutableListOf<AudioProcessor>()
-        val videoEffects = mutableListOf<Effect>()
+        if (!removeAudio && abs(clip.volume - 1.0f) > 0.01f) {
+          audioProcessors.add(Media3EffectsFactory.buildVolumeAudioProcessor(clip.volume))
+        }
 
         if (abs(clip.speed - 1.0f) > 0.01f) {
           val speedPair = Effects.createExperimentalSpeedChangingEffect(
@@ -346,12 +475,12 @@ class VideoExportManager @Inject constructor(
           if (!removeAudio) {
             audioProcessors.add(speedPair.first)
           }
-          videoEffects.add(speedPair.second)
+          perClipVideoEffects.add(speedPair.second)
         }
 
         EditedMediaItem.Builder(clippedItem)
           .setRemoveAudio(removeAudio)
-          .setEffects(Effects(audioProcessors, videoEffects))
+          .setEffects(Effects(audioProcessors, perClipVideoEffects))
           .build()
       }
     }
